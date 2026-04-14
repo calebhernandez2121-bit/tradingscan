@@ -1,0 +1,8 @@
+node_modules/
+dist/
+src/
+public/
+index.html
+vite.config.*
+package.json
+package-lock.json
