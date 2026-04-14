@@ -1,0 +1,7 @@
+flask
+pandas
+ta
+requests
+numpy
+gunicorn
+gevent
