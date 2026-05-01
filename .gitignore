@@ -25,6 +25,11 @@ dist-ssr
 .vercel
 
 # Python
-__pycache__
+__pycache__/
 *.pyc
+*.pyo
 .env
+*.db
+dashboard.log
+nohup.out
+restart_dashboard.command

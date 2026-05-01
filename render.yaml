@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: tradingalerts
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dashboard:app --bind 0.0.0.0:$PORT --timeout 120 --worker-class gevent --workers 1
+    envVars:
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: FLASK_SECRET_KEY
+        sync: false

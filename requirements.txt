@@ -1,7 +1,11 @@
 flask
 pandas
-ta
-requests
 numpy
+requests
+ta
+scipy
+authlib
+stripe
+pytz
 gunicorn
 gevent
