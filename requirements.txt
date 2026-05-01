@@ -8,4 +8,3 @@ authlib
 stripe
 pytz
 gunicorn
-gevent
