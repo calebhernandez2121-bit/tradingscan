@@ -26,8 +26,8 @@ ET_TZ = pytz.timezone("America/New_York")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-API_KEY    = os.environ.get("APCA_API_KEY_ID", "PKIDMLMR2MVR7465HJJKG6MKMM")
-API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "CXJHiFeYUH3jdKCuPRTh65mXKzCDhz6HxQ8MdSyxz4Lr")
+API_KEY    = os.environ.get("APCA_API_KEY_ID", "PK6EL5DWC4LRRX7LMMHMIGL5YF")
+API_SECRET = os.environ.get("APCA_API_SECRET_KEY", "9ReJZu61ANVBwT5wVacXrTYtFWtnTkfy93NHkVgQNbP7")
 BASE_URL   = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 DATA_URL   = "https://data.alpaca.markets"
 
