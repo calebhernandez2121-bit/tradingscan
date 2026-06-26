@@ -8,3 +8,6 @@ authlib
 stripe
 pytz
 gunicorn
+huggingface_hub
+safetensors
+einops

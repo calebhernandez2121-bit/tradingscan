@@ -6,6 +6,7 @@ Full-market scanner · 5-criteria signal detection · Backtest engine
 
 import json, math, os, queue, random, sqlite3, threading, time, logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 import pytz
 
 import numpy as np
@@ -161,6 +162,22 @@ daily_trade_count = 0
 trading_halted    = False
 daily_risk_lock   = threading.Lock()
 _last_risk_reset_date: str = ""   # ET date string "YYYY-MM-DD"
+
+# ── Kronos AI Auto-Trade State ─────────────────────────────────────────────────
+HF_TOKEN                  = os.environ.get("HF_TOKEN", "")
+KRONOS_MODEL_ID           = "NeoQuasar/Kronos-mini"
+KRONOS_CONFIDENCE_MIN     = 0.75
+KRONOS_RR_MIN             = 2.0
+KRONOS_ATR_STOP_MULT      = 1.5
+KRONOS_ATR_TARGET_MULT    = 3.0
+kronos_auto_trade_enabled = True
+kronos_auto_trade_count   = 0    # resets with daily_trade_count
+kronos_auto_trade_log: list = [] # [{symbol, direction, confidence, rr, action, reason, ts}]
+kronos_log_lock           = threading.Lock()
+_kronos_cache: dict       = {}   # symbol → (prediction_dict, epoch)
+KRONOS_CACHE_TTL          = 90   # seconds
+_kronos_model             = None # lazy-loaded local model
+_kronos_ready             = False
 
 # ── 2-Pass Scanner State ────────────────────────────────────────────────────────
 # daily_watchlist: symbols that passed Pass 1 RVOL screen today → {symbol: rvol}
@@ -924,7 +941,7 @@ def _run_trailing_check():
 
 def trailing_stop_manager():
     """Daemon thread: checks all open positions every 30 s for trailing stop adjustments."""
-    global daily_loss_total, daily_trade_count, trading_halted, _last_risk_reset_date
+    global daily_loss_total, daily_trade_count, trading_halted, _last_risk_reset_date, kronos_auto_trade_count
     log.info("Trailing stop manager started")
     while True:
         # ── Midnight ET reset of daily risk counters ──────────────────────
@@ -934,6 +951,7 @@ def trailing_stop_manager():
                 daily_loss_total  = 0.0
                 daily_trade_count = 0
                 trading_halted    = False
+            kronos_auto_trade_count = 0
             _last_risk_reset_date = today_et
             log.info(f"Daily risk counters reset for {today_et}")
         try:
@@ -1369,6 +1387,332 @@ def check_criteria(symbol: str, df: pd.DataFrame, equity: float,
     }
 
 
+# ── Kronos AI Prediction ───────────────────────────────────────────────────────
+
+def _kronos_ta_predict(symbol: str, df: pd.DataFrame) -> dict:
+    """
+    TA-ensemble directional prediction. Used as fallback when Kronos model
+    is unavailable. Five indicators vote on direction; confidence reflects
+    agreement level.
+    """
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    volume = df["volume"]
+
+    rsi       = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+    macd_obj  = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_diff = macd_obj.macd_diff().iloc[-1]
+    ema9      = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
+    ema21     = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
+    bb        = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+    bb_pct    = bb.bollinger_pband().iloc[-1]
+    atr       = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+    cur_price = float(close.iloc[-1])
+
+    avg_vol = volume.iloc[-21:-1].mean()
+    rvol    = float(volume.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+
+    votes = []
+    votes.append( 1 if rsi > 60 else (-1 if rsi < 40 else 0))
+    votes.append( 1 if macd_diff > 0 else (-1 if macd_diff < 0 else 0))
+    votes.append( 1 if ema9 > ema21 else -1)
+    votes.append( 1 if bb_pct > 0.55 else (-1 if bb_pct < 0.45 else 0))
+    votes.append( 1 if rvol > 2 else (-1 if rvol < 0.8 else 0))
+
+    net    = sum(votes)
+    total  = len(votes)
+    norm   = net / total   # -1.0 to +1.0
+
+    if norm > 0.15:
+        direction = "long"
+    elif norm < -0.15:
+        direction = "short"
+    else:
+        direction = "neutral"
+
+    confidence    = round(min(0.94, 0.45 + abs(norm) * 0.55), 3)
+    pred_pct_move = round(abs(norm) * (atr / cur_price * 100) * 1.8, 3)
+
+    entry  = cur_price
+    stop   = round(entry - KRONOS_ATR_STOP_MULT   * atr, 2) if direction == "long"  else round(entry + KRONOS_ATR_STOP_MULT   * atr, 2)
+    target = round(entry + KRONOS_ATR_TARGET_MULT * atr, 2) if direction == "long"  else round(entry - KRONOS_ATR_TARGET_MULT * atr, 2)
+    rr_ratio = round(abs(target - entry) / max(abs(entry - stop), 0.001), 2)
+
+    return {
+        "direction":         direction,
+        "confidence":        confidence,
+        "predicted_pct_move": pred_pct_move,
+        "entry":             round(entry, 2),
+        "target":            target,
+        "stop":              stop,
+        "rr_ratio":          rr_ratio,
+        "method":            "ta_ensemble",
+    }
+
+
+def _kronos_hf_predict(symbol: str, df: pd.DataFrame) -> Optional[dict]:
+    """
+    Attempt HuggingFace Inference API for NeoQuasar/Kronos-mini.
+    Returns prediction dict or None on failure.
+    """
+    if not HF_TOKEN:
+        return None
+    try:
+        bars = df[["open", "high", "low", "close", "volume"]].tail(60).values.tolist()
+        payload = {"inputs": {"ohlcv": bars, "symbol": symbol}}
+        url     = f"https://api-inference.huggingface.co/models/{KRONOS_MODEL_ID}"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if r.status_code != 200:
+            log.debug(f"Kronos HF API {symbol}: HTTP {r.status_code}")
+            return None
+        resp = r.json()
+        # Parse if API returns direction/confidence directly
+        if isinstance(resp, dict) and "direction" in resp:
+            return resp
+    except Exception as e:
+        log.debug(f"Kronos HF API {symbol}: {e}")
+    return None
+
+
+def _kronos_local_predict(symbol: str, df: pd.DataFrame) -> Optional[dict]:
+    """
+    Attempt local Kronos inference using the GitHub repo's model package.
+    Lazy-clones the repo on first call and caches the model in memory.
+    Returns prediction dict or None on failure.
+    """
+    global _kronos_model, _kronos_ready
+    if _kronos_ready is False and _kronos_model is None:
+        # Try lazy setup once
+        import subprocess, sys
+        kronos_dir = os.path.expanduser("~/.kronos_model/Kronos")
+        if not os.path.isdir(kronos_dir):
+            try:
+                log.info("Kronos: cloning GitHub repo for local inference…")
+                subprocess.run(
+                    ["git", "clone", "--depth", "1",
+                     "https://github.com/shiyu-coder/Kronos.git", kronos_dir],
+                    check=True, timeout=120, capture_output=True,
+                )
+                # Install Kronos python deps
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet",
+                     "torch", "einops", "safetensors", "huggingface_hub"],
+                    check=True, timeout=300, capture_output=True,
+                )
+                log.info("Kronos: repo cloned and deps installed")
+            except Exception as e:
+                log.warning(f"Kronos: local setup failed: {e}")
+                _kronos_ready = False
+                return None
+
+        try:
+            model_code_dir = os.path.join(kronos_dir)
+            if model_code_dir not in sys.path:
+                sys.path.insert(0, model_code_dir)
+            from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: PLC0415
+            tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            model     = Kronos.from_pretrained(KRONOS_MODEL_ID)
+            _kronos_model = KronosPredictor(model, tokenizer, max_context=400)
+            _kronos_ready = True
+            log.info("Kronos: local model loaded")
+        except Exception as e:
+            log.warning(f"Kronos: local model load failed: {e}")
+            _kronos_ready = False
+            return None
+
+    if not _kronos_ready or _kronos_model is None:
+        return None
+
+    try:
+        x_df = df[["open", "high", "low", "close", "volume"]].tail(400).copy()
+        x_df.index = pd.to_datetime(x_df.index)
+        freq      = pd.tseries.frequencies.to_offset("5T")
+        last_ts   = x_df.index[-1]
+        pred_len  = 12  # predict next 12 bars (~1 hour of 5-min bars)
+        y_ts      = pd.date_range(start=last_ts + freq, periods=pred_len, freq=freq)
+
+        pred_df = _kronos_model.predict(
+            df=x_df, x_timestamp=x_df.index,
+            y_timestamp=y_ts, pred_len=pred_len,
+            T=1.0, top_p=0.9, sample_count=1, verbose=False,
+        )
+
+        current_price = float(x_df["close"].iloc[-1])
+        pred_close    = float(pred_df["close"].iloc[-1]) if "close" in pred_df.columns else current_price
+        pct_move      = (pred_close - current_price) / current_price * 100
+
+        atr_val = ta.volatility.AverageTrueRange(
+            df["high"], df["low"], df["close"], window=14
+        ).average_true_range().iloc[-1]
+
+        direction = "long" if pct_move > 0.2 else ("short" if pct_move < -0.2 else "neutral")
+        confidence = round(min(0.94, 0.5 + abs(pct_move) / 3.0), 3)
+        stop   = round(current_price - KRONOS_ATR_STOP_MULT   * atr_val, 2)
+        target = round(current_price + KRONOS_ATR_TARGET_MULT * atr_val, 2)
+        rr     = round(abs(target - current_price) / max(abs(current_price - stop), 0.001), 2)
+
+        return {
+            "direction":          direction,
+            "confidence":         confidence,
+            "predicted_pct_move": round(abs(pct_move), 3),
+            "entry":              round(current_price, 2),
+            "target":             target,
+            "stop":               stop,
+            "rr_ratio":           rr,
+            "method":             "kronos_local",
+        }
+    except Exception as e:
+        log.warning(f"Kronos local inference {symbol}: {e}")
+        return None
+
+
+def predict_kronos(symbol: str, bars_df: pd.DataFrame) -> dict:
+    """
+    Get Kronos AI prediction for a symbol.
+    Three-tier fallback:
+      1. HuggingFace Inference API (requires HF_TOKEN + model endpoint)
+      2. Local Kronos model (lazy git-clone on first call)
+      3. TA-ensemble (always available)
+    Result is cached per-symbol for KRONOS_CACHE_TTL seconds.
+    """
+    now = time.time()
+    cached = _kronos_cache.get(symbol)
+    if cached and (now - cached[1]) < KRONOS_CACHE_TTL:
+        return cached[0]
+
+    result = _kronos_hf_predict(symbol, bars_df)
+    if result is None:
+        result = _kronos_local_predict(symbol, bars_df)
+    if result is None:
+        result = _kronos_ta_predict(symbol, bars_df)
+
+    _kronos_cache[symbol] = (result, now)
+    return result
+
+
+def _try_kronos_auto_trade(symbol: str, alert: dict, kronos_pred: Optional[dict], equity: float):
+    """
+    Place a Kronos-driven bracket order when all safeguards pass.
+    Conditions:
+      • kronos_auto_trade_enabled is True
+      • trading_halted is False
+      • daily_trade_count < DAILY_MAX_TRADES
+      • daily_pnl > -DAILY_MAX_LOSS  (tracked via daily_loss_total)
+      • Kronos direction == 'long'
+      • Kronos confidence >= KRONOS_CONFIDENCE_MIN
+      • Kronos rr_ratio >= KRONOS_RR_MIN
+      • Alert entry_type contains 'Gap and Go'
+    """
+    global daily_trade_count, trading_halted, kronos_auto_trade_count
+
+    if not kronos_auto_trade_enabled:
+        return
+
+    ts = datetime.now().isoformat()
+
+    def _log_skip(reason: str):
+        with kronos_log_lock:
+            kronos_auto_trade_log.append({
+                "symbol": symbol, "ts": ts,
+                "action": "skip", "reason": reason,
+                "kronos": kronos_pred,
+            })
+            if len(kronos_auto_trade_log) > 200:
+                kronos_auto_trade_log.pop(0)
+
+    if kronos_pred is None:
+        _log_skip("no Kronos prediction")
+        return
+
+    # Only fire on Gap-and-Go alerts
+    if not (alert.get("entry_type") or "").startswith("Gap and Go"):
+        return
+
+    direction  = kronos_pred.get("direction", "neutral")
+    confidence = float(kronos_pred.get("confidence", 0))
+    rr_ratio   = float(kronos_pred.get("rr_ratio", 0))
+
+    if direction != "long":
+        _log_skip(f"direction={direction} (need long)")
+        return
+    if confidence < KRONOS_CONFIDENCE_MIN:
+        _log_skip(f"confidence={confidence:.2%} < {KRONOS_CONFIDENCE_MIN:.0%}")
+        return
+    if rr_ratio < KRONOS_RR_MIN:
+        _log_skip(f"rr_ratio={rr_ratio:.2f} < {KRONOS_RR_MIN:.1f}")
+        return
+
+    with daily_risk_lock:
+        if trading_halted:
+            _log_skip("trading_halted")
+            return
+        if daily_trade_count >= DAILY_MAX_TRADES:
+            _log_skip(f"daily_trade_count={daily_trade_count} >= {DAILY_MAX_TRADES}")
+            return
+        if daily_loss_total >= DAILY_MAX_LOSS:
+            _log_skip(f"daily_loss_total=${daily_loss_total:.2f} >= ${DAILY_MAX_LOSS:.2f}")
+            return
+
+    # Calculate position size: risk 1% of equity, stop = ATR * 1.5 below entry
+    entry_price = float(alert["entry"])
+    atr_val     = float(alert.get("atr") or 0.5)
+    stop_price  = round(entry_price - KRONOS_ATR_STOP_MULT * atr_val, 2)
+    target_price = round(entry_price + KRONOS_ATR_TARGET_MULT * atr_val, 2)
+    risk_per_share = entry_price - stop_price
+    if risk_per_share <= 0:
+        _log_skip("invalid risk (entry <= stop)")
+        return
+
+    dollar_risk = equity * ACCOUNT_RISK_PCT
+    qty         = max(1, math.floor(dollar_risk / risk_per_share))
+
+    try:
+        order = submit_bracket_order(symbol, qty, entry_price, stop_price, target_price)
+        order_id = (order or {}).get("id", "?")
+        with daily_risk_lock:
+            daily_trade_count      += 1
+        kronos_auto_trade_count    += 1
+
+        entry_data = {
+            **alert,
+            "entry_type": f"[Kronos] {alert['entry_type']}",
+            "qty": qty, "stop": stop_price, "target": target_price,
+        }
+        log_trade(entry_data, order_id)
+
+        log_entry = {
+            "symbol": symbol, "ts": ts, "action": "placed",
+            "qty": qty, "entry": entry_price,
+            "stop": stop_price, "target": target_price,
+            "order_id": order_id, "kronos": kronos_pred,
+        }
+        with kronos_log_lock:
+            kronos_auto_trade_log.append(log_entry)
+            if len(kronos_auto_trade_log) > 200:
+                kronos_auto_trade_log.pop(0)
+
+        log.info(
+            f"[Kronos AUTO-TRADE] {symbol} {qty}sh @${entry_price:.2f} "
+            f"stop=${stop_price:.2f} target=${target_price:.2f} "
+            f"confidence={confidence:.0%} rr={rr_ratio:.1f}:1 order={order_id}"
+        )
+        broadcast("kronos_trade", {
+            "symbol": symbol, "qty": qty,
+            "entry": entry_price, "stop": stop_price, "target": target_price,
+            "confidence": confidence, "rr_ratio": rr_ratio,
+            "order_id": order_id,
+        })
+    except Exception as e:
+        log.warning(f"[Kronos AUTO-TRADE] {symbol} order failed: {e}")
+        with kronos_log_lock:
+            kronos_auto_trade_log.append({
+                "symbol": symbol, "ts": ts, "action": "error",
+                "reason": str(e), "kronos": kronos_pred,
+            })
+
+
 # ── Watchlist Scan Loop ────────────────────────────────────────────────────────
 
 def watchlist_scan_loop():
@@ -1656,6 +2000,14 @@ def run_scan():
                 alert = None
 
             if alert:
+                # ── Kronos AI prediction (attached to every alert) ────────────
+                try:
+                    kronos_pred = predict_kronos(sym, df)
+                except Exception as kpe:
+                    log.debug(f"predict_kronos {sym}: {kpe}")
+                    kronos_pred = None
+                alert["kronos"] = kronos_pred
+
                 new_alerts.append(alert)
                 broadcast("alert", alert)
                 log.info(
@@ -1663,8 +2015,10 @@ def run_scan():
                     f"RVOL {alert['rvol']}x  gap {alert['gap_pct']}%  "
                     f"chg {alert['pct_change_today']}%"
                     + ("  [OUTSIDE PRIME]" if alert.get("outside_prime") else "")
+                    + (f"  [Kronos {kronos_pred['direction'].upper()} {kronos_pred['confidence']:.0%}]" if kronos_pred else "")
                 )
 
+                # ── Existing manual auto-trade toggle ─────────────────────────
                 with state_lock:
                     auto = state["auto_trade"]
                 if auto:
@@ -1676,6 +2030,9 @@ def run_scan():
                     except Exception as te:
                         log.warning(f"Auto-trade failed {sym}: {te}")
                         broadcast("trade", {"symbol": sym, "status": "failed", "error": str(te)})
+
+                # ── Kronos auto-trade (Gap-and-Go + high-confidence AI signal) ─
+                _try_kronos_auto_trade(sym, alert, kronos_pred, equity)
 
         scanned = min((batch_idx + 1) * BATCH_SIZE, total)
         with state_lock:
@@ -2534,6 +2891,40 @@ def api_alerts_clear():
     return jsonify({"ok": True})
 
 
+# ── Kronos API Endpoints ───────────────────────────────────────────────────────
+
+@app.route("/api/kronos/status")
+@login_required
+def api_kronos_status():
+    """Return recent Kronos predictions and auto-trade log."""
+    global kronos_auto_trade_count
+    with kronos_log_lock:
+        log_copy = list(kronos_auto_trade_log[-50:])
+    return jsonify({
+        "auto_trade_enabled": kronos_auto_trade_enabled,
+        "auto_trade_count":   kronos_auto_trade_count,
+        "daily_max_trades":   DAILY_MAX_TRADES,
+        "model":              KRONOS_MODEL_ID,
+        "confidence_min":     KRONOS_CONFIDENCE_MIN,
+        "rr_min":             KRONOS_RR_MIN,
+        "local_model_ready":  _kronos_ready,
+        "log":                log_copy,
+    })
+
+
+@app.route("/api/kronos/toggle", methods=["POST"])
+@login_required
+def api_kronos_toggle():
+    """Enable or disable Kronos auto-trading."""
+    global kronos_auto_trade_enabled
+    data    = request.json or {}
+    enabled = bool(data.get("enabled", not kronos_auto_trade_enabled))
+    kronos_auto_trade_enabled = enabled
+    log.info(f"Kronos auto-trade {'ENABLED' if enabled else 'DISABLED'}")
+    broadcast("kronos_toggle", {"enabled": enabled})
+    return jsonify({"ok": True, "enabled": enabled})
+
+
 @app.route("/api/scan_status")
 def api_scan_status():
     """Return last scan timestamp as unix epoch for the scanner status dot."""
@@ -3214,6 +3605,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     #ph { text-align:center; padding:70px 20px; color:var(--text-muted); font-size:11px; line-height:2; }
     #ph .ico { font-size:32px; margin-bottom:14px; opacity:.3; }
+
+    /* ── KRONOS AI BADGES ──────────────────────────────────────────────────── */
+    .kronos-badge {
+      display:inline-flex; align-items:center; gap:5px;
+      font-size:10px; font-weight:600; padding:3px 8px;
+      border-radius:var(--radius-sm); margin-top:8px;
+      border:1px solid transparent;
+    }
+    .kronos-badge.long    { color:#00e87c; background:rgba(0,232,124,.1);  border-color:rgba(0,232,124,.3); }
+    .kronos-badge.short   { color:#ff3d5a; background:rgba(255,61,90,.1);  border-color:rgba(255,61,90,.3); }
+    .kronos-badge.neutral { color:#b8b8d8; background:rgba(184,184,216,.07); border-color:rgba(184,184,216,.2); }
+    .kronos-badge.at-badge { font-size:9px; background:rgba(157,92,255,.15); color:var(--purple); border-color:rgba(157,92,255,.35); }
+    .kronos-stat { font-size:11px; font-weight:600; color:var(--purple); }
   </style>
 </head>
 <body>
@@ -3276,6 +3680,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="kv"><span class="k">Buying Power</span> <span class="v"   id="acc-bp">&#8212;</span></div>
     <div class="kv"><span class="k">Day P&amp;L</span>  <span class="v"   id="acc-pl">&#8212;</span></div>
     <div class="kv"><span class="k">Last Scan</span>    <span class="v"   id="acc-ls">&#8212;</span></div>
+    <div class="kv"><span class="k">Kronos Trades</span><span class="v kronos-stat" id="acc-kt">0</span></div>
   </div>
 
   <div class="hacts">
@@ -3287,6 +3692,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <label class="tog" id="auto-lbl" title="Auto-submit bracket orders on signal">
       <div class="tog-t" id="auto-trk"><div class="tog-k"></div></div>
       <span class="tog-l">Auto</span>
+    </label>
+    <label class="tog" id="kronos-lbl" title="Kronos AI auto-trade (Gap+Go ≥75% confidence)" onclick="toggleKronos()">
+      <div class="tog-t" id="kronos-trk" style="border-color:rgba(157,92,255,.5);"><div class="tog-k"></div></div>
+      <span class="tog-l" style="color:var(--purple)">Kronos</span>
     </label>
     <button class="btn primary" id="btn-start" onclick="startScan()">&#9654; START</button>
     <button class="btn danger"  id="btn-stop"  onclick="stopScan()" disabled>&#9632; STOP</button>
@@ -3803,6 +4212,20 @@ function connectSSE() {
     toast('\u2605 Watchlist signal: ' + a.symbol + ' \u2014 ' + a.entry_type, 'trade');
   });
 
+  es.addEventListener('kronos_trade', function(e) {
+    var d = JSON.parse(e.data);
+    var kt = document.getElementById('acc-kt');
+    if (kt) kt.textContent = parseInt(kt.textContent || '0') + 1;
+    toast('\u26a1 Kronos AUTO-TRADE: ' + d.symbol + ' \xd7' + d.qty +
+          ' @ $' + d.entry + ' | ' + Math.round((d.confidence||0)*100) + '% conf', 'trade');
+  });
+
+  es.addEventListener('kronos_toggle', function(e) {
+    var d = JSON.parse(e.data);
+    kronosAutoEnabled = d.enabled;
+    document.getElementById('kronos-trk').classList.toggle('on', kronosAutoEnabled);
+  });
+
   es.addEventListener('trailing_stop', function(e) {
     var d = JSON.parse(e.data);
     var label = d.phase === 'be' ? 'BREAKEVEN' : 'TRAILING';
@@ -3844,6 +4267,25 @@ document.getElementById('auto-lbl').addEventListener('click', async function() {
   await fetch('/api/auto_trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:autoTrade})});
   toast('Auto-trade ' + (autoTrade ? 'ENABLED' : 'DISABLED'), 'info');
 });
+
+var kronosAutoEnabled = true;
+async function toggleKronos() {
+  kronosAutoEnabled = !kronosAutoEnabled;
+  document.getElementById('kronos-trk').classList.toggle('on', kronosAutoEnabled);
+  await fetch('/api/kronos/toggle', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:kronosAutoEnabled})});
+  toast('Kronos auto-trade ' + (kronosAutoEnabled ? 'ENABLED' : 'DISABLED'), 'info');
+}
+
+async function loadKronosStatus() {
+  try {
+    var r = await fetch('/api/kronos/status');
+    if (!r.ok) return;
+    var d = await r.json();
+    kronosAutoEnabled = d.auto_trade_enabled;
+    document.getElementById('kronos-trk').classList.toggle('on', kronosAutoEnabled);
+    document.getElementById('acc-kt').textContent = d.auto_trade_count || 0;
+  } catch(e) {}
+}
 
 // ── PROGRESS ─────────────────────────────────────────────────────────────────
 function updateProg(scanned, total, eta, alertCount) {
@@ -3941,6 +4383,7 @@ function addCard(a, marketClosed) {
     (!a.prime_window ? '<div class="not-prime-badge">\u26d4 Post-11AM \u2014 Gap\u202f&\u202fGo edge degraded</div>' : '') +
     (a.extended ? '<div class="extended-badge">\u26a0 Extended \u2014 may be chasing</div>' : '') +
     (marketClosed ? '<div class="mkt-closed-badge">\u26a0 Market Closed \u2014 historical signal</div>' : '') +
+    kronosBadge(a.kronos) +
     '<button class="a-trade-btn" onclick="openSymModal(' + JSON.stringify(a) + ')">Place Trade &#8599;</button>';
 
   var grid = document.getElementById('agrid');
@@ -3954,6 +4397,20 @@ function mkCrit(n, label, detail) {
     '<span class="ck">' + label + '</span>' +
     '<span class="cd">' + escHtml(detail) + '</span>' +
   '</div>';
+}
+
+function kronosBadge(k) {
+  if (!k) return '';
+  var dir   = (k.direction || 'neutral').toLowerCase();
+  var pct   = Math.round((k.confidence || 0) * 100);
+  var icon  = dir === 'long' ? '🟢' : dir === 'short' ? '🔴' : '⚪';
+  var label = dir.toUpperCase();
+  var method = k.method === 'kronos_local' ? 'Kronos' : (k.method === 'ta_ensemble' ? 'TA' : 'AI');
+  var html  = '<div class="kronos-badge ' + dir + '">' + icon + ' ' + label + ' ' + pct + '% <span style="opacity:.6;font-size:9px">' + method + '</span></div>';
+  if (dir === 'long' && pct >= 75 && (k.rr_ratio || 0) >= 2) {
+    html += '<div class="kronos-badge at-badge">⚡ Kronos auto-trade eligible (RR ' + (k.rr_ratio || 0).toFixed(1) + ':1)</div>';
+  }
+  return html;
 }
 
 function escHtml(s) {
@@ -5201,6 +5658,7 @@ loadBtSummary();
 loadSectorHeatmap();
 loadWatchlist();
 loadRiskStatus();
+loadKronosStatus();
 setInterval(refreshAccount, 30000);
 setInterval(checkMarketStatus, 60000);
 setInterval(fetchMarketCycle, 300000);
@@ -5213,6 +5671,7 @@ setInterval(loadAccountSummary, 30000);
 loadDailyWatchlist();
 setInterval(loadDailyWatchlist, 60000);
 setInterval(loadRiskStatus, 30000);
+setInterval(loadKronosStatus, 60000);
 
 ['m-mod-entry','m-mod-stop','m-mod-target','m-mod-qty'].forEach(function(id) {
   var el = document.getElementById(id);
