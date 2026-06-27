@@ -2932,13 +2932,7 @@ _kronos_chart_lock = threading.Lock()
 
 
 def _get_kronos_chart_predictor():
-    """Lazy-load the Kronos daily-bar predictor. Returns None if model unavailable.
-
-    Model priority:
-      1. coolshot21/Kronos-base-bucket  (user's private/custom model)
-      2. NeoQuasar/Kronos-base          (public fallback)
-    Tokenizer: NeoQuasar/Kronos-Tokenizer-base (both cases)
-    """
+    """Lazy-load the Kronos daily-bar predictor using public NeoQuasar models."""
     global _kronos_chart_predictor
     if _kronos_chart_predictor is not None:
         return _kronos_chart_predictor
@@ -2947,29 +2941,14 @@ def _get_kronos_chart_predictor():
             return _kronos_chart_predictor
         try:
             import sys as _sys
-            from huggingface_hub import login as _hf_login
-            if HF_TOKEN:
-                _hf_login(token=HF_TOKEN)
             _kdir = os.path.dirname(os.path.abspath(__file__))
             if _kdir not in _sys.path:
                 _sys.path.insert(0, _kdir)
             from kronos_model import KronosTokenizer, Kronos, KronosPredictor
-            _tok = KronosTokenizer.from_pretrained(
-                "NeoQuasar/Kronos-Tokenizer-base", token=HF_TOKEN or None
-            )
-            # Try user model first, fall back to public NeoQuasar base
-            _model_ids = ["coolshot21/Kronos-base-bucket", "NeoQuasar/Kronos-base"]
-            _mdl = None
-            for _mid in _model_ids:
-                try:
-                    _mdl = Kronos.from_pretrained(_mid, token=HF_TOKEN or None)
-                    log.info(f"Kronos chart model loaded: {_mid}")
-                    break
-                except Exception as _me:
-                    log.warning(f"Kronos model {_mid} unavailable: {_me}")
-            if _mdl is None:
-                raise RuntimeError("No Kronos model could be loaded")
+            _tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            _mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
             _kronos_chart_predictor = KronosPredictor(_mdl, _tok, device="cpu", max_context=512)
+            log.info("Kronos chart model loaded: NeoQuasar/Kronos-small")
         except Exception as _ke:
             log.warning(f"Kronos chart model not available: {_ke}")
     return _kronos_chart_predictor
@@ -3113,7 +3092,10 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .lt{color:var(--muted);font-size:14px}.ls{color:var(--muted);font-size:11px;opacity:.6}
 #foot{padding:7px 24px;background:var(--bg2);border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)}
 #cd{color:var(--purple)}
-@media(max-width:600px){#stats{gap:14px;padding:8px 14px}#hdr{padding:10px 14px}}
+@media(max-width:600px){
+#stats{gap:14px;padding:8px 14px}
+#hdr{padding:10px 14px}
+}
 </style>
 </head>
 <body>
