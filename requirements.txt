@@ -11,3 +11,5 @@ gunicorn
 huggingface_hub
 safetensors
 einops
+torch
+transformers

@@ -2925,6 +2925,292 @@ def api_kronos_toggle():
     return jsonify({"ok": True, "enabled": enabled})
 
 
+# ── Kronos Chart Prediction (public — no login required) ─────────────────────
+
+_kronos_chart_predictor = None
+_kronos_chart_lock = threading.Lock()
+
+
+def _get_kronos_chart_predictor():
+    """Lazy-load the Kronos daily-bar predictor. Returns None if model unavailable."""
+    global _kronos_chart_predictor
+    if _kronos_chart_predictor is not None:
+        return _kronos_chart_predictor
+    with _kronos_chart_lock:
+        if _kronos_chart_predictor is not None:
+            return _kronos_chart_predictor
+        try:
+            import sys as _sys
+            _kdir = os.path.dirname(os.path.abspath(__file__))
+            if _kdir not in _sys.path:
+                _sys.path.insert(0, _kdir)
+            from kronos_model import KronosTokenizer, Kronos, KronosPredictor
+            _tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            _mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+            _kronos_chart_predictor = KronosPredictor(_mdl, _tok, device="cpu", max_context=512)
+            log.info("Kronos chart model loaded successfully")
+        except Exception as _ke:
+            log.warning(f"Kronos chart model not available: {_ke}")
+    return _kronos_chart_predictor
+
+
+@app.route("/api/kronos/predict/<symbol>")
+def api_kronos_predict(symbol):
+    """Public — fetch daily bars, run Kronos AI (or TA fallback), return chart JSON."""
+    try:
+        symbol = symbol.upper()
+        end    = datetime.now(ET_TZ)
+        start  = end - timedelta(days=400)
+        params = {
+            "timeframe": "1Day",
+            "start":     start.strftime("%Y-%m-%dT00:00:00Z"),
+            "end":       end.strftime("%Y-%m-%dT23:59:59Z"),
+            "limit":     300,
+            "feed":      "iex",
+            "adjustment":"split",
+            "sort":      "asc",
+        }
+        resp = requests.get(f"{DATA_URL}/v2/stocks/{symbol}/bars",
+                            headers=HEADERS, params=params, timeout=15)
+        bars = resp.json().get("bars", [])
+        if len(bars) < 30:
+            return jsonify({"error": "insufficient historical data"}), 400
+
+        df = pd.DataFrame(bars)
+        df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume","t":"timestamp"}, inplace=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df[["open","high","low","close","volume","timestamp"]].tail(200).reset_index(drop=True)
+
+        pred_len      = 30
+        current_price = float(df["close"].iloc[-1])
+        last_ts       = df["timestamp"].iloc[-1]
+        future_dates  = pd.bdate_range(start=last_ts + timedelta(days=1), periods=pred_len)
+        method        = "ta_ensemble"
+        pred_df       = None
+
+        predictor = _get_kronos_chart_predictor()
+        if predictor is not None:
+            try:
+                x_df = df[["open","high","low","close","volume"]].copy()
+                pred_df = predictor.predict(
+                    df=x_df,
+                    x_timestamp=df["timestamp"],
+                    y_timestamp=pd.Series(future_dates),
+                    pred_len=pred_len,
+                    T=0.8, top_p=0.9, sample_count=3, verbose=False,
+                )
+                method = "kronos"
+            except Exception as ke:
+                log.warning(f"Kronos chart predict {symbol}: {ke}")
+                pred_df = None
+
+        # TA-ensemble fallback: linear trend + ATR jitter
+        if pred_df is None:
+            from scipy.stats import linregress as _lr
+            closes = df["close"].values[-60:]
+            slope, intercept, *_ = _lr(np.arange(len(closes)), closes)
+            atr_val = float(
+                ta.volatility.AverageTrueRange(
+                    df["high"], df["low"], df["close"], window=14
+                ).average_true_range().iloc[-1]
+            )
+            rng = np.random.default_rng(42)
+            rows = []
+            for i, ts in enumerate(future_dates):
+                mid   = intercept + slope * (len(closes) + i)
+                noise = atr_val * 0.25 * rng.standard_normal()
+                o = mid + noise
+                c = mid + slope * 0.5 + noise * 0.6
+                h = max(o, c) + atr_val * 0.4
+                l = min(o, c) - atr_val * 0.4
+                rows.append({"timestamp": ts, "open": o, "high": h, "low": l, "close": c})
+            pred_df = pd.DataFrame(rows).set_index("timestamp")
+
+        pred_close = float(pred_df["close"].iloc[-1])
+        pct_move   = (pred_close - current_price) / current_price * 100
+        direction  = "LONG" if pred_close > current_price else "SHORT"
+
+        history = [
+            {"t": row["timestamp"].strftime("%Y-%m-%d"),
+             "o": round(row["open"],2), "h": round(row["high"],2),
+             "l": round(row["low"],2),  "c": round(row["close"],2)}
+            for _, row in df.tail(60).iterrows()
+        ]
+        forecast = []
+        for ts, row in pred_df.iterrows():
+            t = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            forecast.append({
+                "t": t,
+                "o": round(float(row["open"]),2),  "h": round(float(row["high"]),2),
+                "l": round(float(row["low"]),2),   "c": round(float(row["close"]),2),
+            })
+
+        return jsonify({
+            "symbol":              symbol,
+            "current_price":       round(current_price, 2),
+            "predicted_price_30d": round(pred_close, 2),
+            "direction":           direction,
+            "predicted_pct_move":  round(pct_move, 2),
+            "method":              method,
+            "history":             history,
+            "forecast":            forecast,
+        })
+
+    except Exception as e:
+        log.exception(f"Kronos chart predict error for {symbol}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+KRONOS_CHART_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kronos AI &mdash; SPY Live Prediction</title>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0d0d1a;--bg2:#13132a;--border:rgba(255,255,255,.08);--text:#e8e8f4;--muted:#7878a8;--purple:#9d5cff;--green:#00e87c;--red:#ff3d5a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column}
+#hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;background:var(--bg2);border-bottom:1px solid var(--border)}
+#hdr h1{font-size:20px;font-weight:700;letter-spacing:-.5px}
+#hdr h1 .k{color:var(--purple)}
+#badge{padding:5px 14px;border-radius:20px;font-weight:700;font-size:13px;border:1px solid;transition:all .3s}
+#badge.long{color:var(--green);background:rgba(0,232,124,.1);border-color:rgba(0,232,124,.3)}
+#badge.short{color:var(--red);background:rgba(255,61,90,.1);border-color:rgba(255,61,90,.3)}
+#badge.idle{color:var(--muted);background:rgba(120,120,168,.07);border-color:rgba(120,120,168,.2)}
+#stats{display:flex;gap:28px;padding:10px 24px;background:var(--bg2);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.sv{display:flex;flex-direction:column;gap:2px}
+.sk{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.vv{font-weight:700;font-size:15px}
+#wrap{position:relative;flex:1;min-height:400px}
+#chart{width:100%;height:100%}
+#overlay{position:absolute;inset:0;background:rgba(13,13,26,.88);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:10}
+#overlay.gone{display:none}
+.spin{width:44px;height:44px;border:3px solid var(--border);border-top-color:var(--purple);border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.lt{color:var(--muted);font-size:14px}.ls{color:var(--muted);font-size:11px;opacity:.6}
+#foot{padding:7px 24px;background:var(--bg2);border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)}
+#cd{color:var(--purple)}
+@media(max-width:600px){#stats{gap:14px;padding:8px 14px}#hdr{padding:10px 14px}}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <h1>&#9889; <span class="k">Kronos</span> AI &mdash; SPY Live Prediction</h1>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div id="badge" class="idle">Loading&hellip;</div>
+    <a href="/" style="color:var(--muted);text-decoration:none;font-size:12px">&larr; Dashboard</a>
+  </div>
+</div>
+<div id="stats">
+  <div class="sv"><span class="sk">Current Price</span><span class="vv" id="sc">&#8212;</span></div>
+  <div class="sv"><span class="sk">30-Day Target</span><span class="vv" id="st">&#8212;</span></div>
+  <div class="sv"><span class="sk">Predicted Move</span><span class="vv" id="sm">&#8212;</span></div>
+  <div class="sv"><span class="sk">Model</span><span class="vv" id="smod" style="color:var(--purple)">&#8212;</span></div>
+  <div class="sv"><span class="sk">Updated</span><span class="vv" id="su" style="font-size:12px">&#8212;</span></div>
+</div>
+<div id="wrap">
+  <div id="chart"></div>
+  <div id="overlay">
+    <div class="spin"></div>
+    <div class="lt">Kronos AI generating 30-day forecast&hellip;</div>
+    <div class="ls">Model warm-up may take 30&ndash;60s on first load</div>
+  </div>
+</div>
+<div id="foot">
+  <span>Powered by <strong style="color:var(--purple)">Kronos AI</strong> &middot; Data via Alpaca Markets</span>
+  <span id="cd">Refreshing in 60s</span>
+</div>
+<script>
+var chart=null,hSer=null,fSer=null,cd=60,cdTimer=null;
+
+function mkChart(){
+  var el=document.getElementById('chart');
+  chart=LightweightCharts.createChart(el,{
+    width:el.offsetWidth,height:el.offsetHeight,
+    layout:{background:{color:'#0d0d1a'},textColor:'#7878a8'},
+    grid:{vertLines:{color:'rgba(255,255,255,.04)'},horzLines:{color:'rgba(255,255,255,.04)'}},
+    rightPriceScale:{borderColor:'rgba(255,255,255,.1)'},
+    timeScale:{borderColor:'rgba(255,255,255,.1)',timeVisible:false},
+    crosshair:{mode:1}
+  });
+  hSer=chart.addCandlestickSeries({
+    upColor:'#00e87c',downColor:'#ff3d5a',
+    borderUpColor:'#00e87c',borderDownColor:'#ff3d5a',
+    wickUpColor:'#00e87c',wickDownColor:'#ff3d5a'
+  });
+  fSer=chart.addCandlestickSeries({
+    upColor:'rgba(0,232,124,.4)',downColor:'rgba(255,61,90,.4)',
+    borderUpColor:'rgba(0,232,124,.7)',borderDownColor:'rgba(255,61,90,.7)',
+    wickUpColor:'rgba(0,232,124,.5)',wickDownColor:'rgba(255,61,90,.5)'
+  });
+  window.addEventListener('resize',function(){
+    chart.applyOptions({width:el.offsetWidth,height:el.offsetHeight});
+  });
+}
+
+async function load(){
+  try{
+    var r=await fetch('/api/kronos/predict/SPY');
+    if(!r.ok){showErr('API error '+r.status);return;}
+    var d=await r.json();
+    if(d.error){showErr(d.error);return;}
+    if(!chart)mkChart();
+    var isLong=d.direction==='LONG';
+    var gc='rgba(0,232,124,',rc='rgba(255,61,90,';
+    var fc=isLong?gc:rc;
+    fSer.applyOptions({
+      upColor:fc+'.45)',downColor:fc+'.25)',
+      borderUpColor:fc+'.8)',borderDownColor:fc+'.5)',
+      wickUpColor:fc+'.6)',wickDownColor:fc+'.4)'
+    });
+    hSer.setData((d.history||[]).map(function(b){return{time:b.t,open:b.o,high:b.h,low:b.l,close:b.c};}));
+    fSer.setData((d.forecast||[]).map(function(b){return{time:b.t,open:b.o,high:b.h,low:b.l,close:b.c};}));
+    chart.timeScale().fitContent();
+    var badge=document.getElementById('badge');
+    badge.textContent=isLong?'▲ LONG':'▼ SHORT';
+    badge.className=isLong?'long':'short';
+    var sign=d.predicted_pct_move>=0?'+':'';
+    document.getElementById('sc').textContent='$'+(d.current_price||0).toFixed(2);
+    document.getElementById('st').textContent='$'+(d.predicted_price_30d||0).toFixed(2);
+    var sm=document.getElementById('sm');
+    sm.textContent=sign+(d.predicted_pct_move||0).toFixed(2)+'%';
+    sm.style.color=isLong?'#00e87c':'#ff3d5a';
+    document.getElementById('smod').textContent=d.method==='kronos'?'Kronos AI':'TA Ensemble';
+    document.getElementById('su').textContent=new Date().toLocaleTimeString();
+    document.getElementById('overlay').classList.add('gone');
+    startCd();
+  }catch(e){showErr('Network: '+e.message);}
+}
+
+function showErr(msg){
+  var o=document.getElementById('overlay');
+  o.innerHTML='<div style="color:#ff3d5a;text-align:center;padding:20px;border:1px solid rgba(255,61,90,.2);border-radius:8px;background:rgba(255,61,90,.05)">⚠ '+msg+'<br><small style="opacity:.6">Retrying in 60s…</small></div>';
+  startCd();
+}
+
+function startCd(){
+  cd=60;
+  if(cdTimer)clearInterval(cdTimer);
+  cdTimer=setInterval(function(){
+    cd--;
+    document.getElementById('cd').textContent='Refreshing in '+cd+'s';
+    if(cd<=0){cd=60;load();}
+  },1000);
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/kronos")
+def kronos_page():
+    return render_template_string(KRONOS_CHART_HTML)
+
+
 @app.route("/api/scan_status")
 def api_scan_status():
     """Return last scan timestamp as unix epoch for the scanner status dot."""
