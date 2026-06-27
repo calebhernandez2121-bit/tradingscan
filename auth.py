@@ -141,10 +141,8 @@ def callback():
     session["user_picture"] = picture
     session["user_email"]   = email
 
-    user = get_user(google_id)
-    if user and user["subscription_status"] in ("trialing", "active"):
-        return redirect("/")
-    return redirect("/auth/subscribe")
+    # Paywall disabled — all logged-in users go straight to dashboard
+    return redirect("/")
 
 
 @auth_bp.route("/auth/logout")
